@@ -47,6 +47,58 @@ def init_dist(launcher: str, backend: str = 'nccl', **kwargs) -> None:
         raise ValueError(f'Invalid launcher type: {launcher}')
 
 
+def fn_replace(src, tar, prefix=''):
+    import sys
+
+    for k in sys.modules:
+        if k.startswith(prefix):
+            if isinstance(tar, (list, tuple)):
+                for target in tar:
+                    if getattr(sys.modules[k], target, None):
+                        setattr(sys.modules[k], target, src)
+            else:
+                if getattr(sys.modules[k], tar, None):
+                    setattr(sys.modules[k], tar, src)
+
+
+def wrap_dtype_for_hccl():
+    import copy
+    from functools import wraps
+
+    from torch import distributed as dist
+
+    wrap_dtype_dict = {
+        'torch.uint8': torch.int,
+        'torch.long': torch.int,
+        'torch.int64': torch.int,
+        'torch.double': torch.float,
+        'torch.float64': torch.float,
+    }
+
+    def wrapper_dist_long2int(fn):
+
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            if str(args[0].dtype) in wrap_dtype_dict.keys():
+                new_args = [copy.deepcopy(args[0])] + list(args[1:])
+                raw_type = args[0].dtype
+                tar_type = wrap_dtype_dict[str(args[0].dtype)]
+                new_args[0] = new_args[0].to(tar_type)
+                fn(*new_args, **kwargs)
+                args[0].copy_(new_args[0].to(raw_type))
+                return
+            return fn(*args, **kwargs)
+
+        return wrapper
+
+    fn_replace(
+        wrapper_dist_long2int(dist.all_reduce), 'all_reduce',
+        'torch.distributed')
+    fn_replace(
+        wrapper_dist_long2int(dist.broadcast), 'broadcast',
+        'torch.distributed')
+
+
 def _init_dist_pytorch(backend: str, **kwargs) -> None:
     # TODO: use local_rank instead of rank % num_gpus
     rank = int(os.environ['RANK'])
@@ -61,6 +113,7 @@ def _init_dist_pytorch(backend: str, **kwargs) -> None:
     elif IS_NPU_AVAILABLE:
         import torch_npu  # noqa: F401
         torch.npu.set_device(rank)
+        wrap_dtype_for_hccl()
         dist.init_process_group(
             backend='hccl',
             rank=rank,
